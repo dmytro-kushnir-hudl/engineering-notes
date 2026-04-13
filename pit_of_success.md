@@ -12,6 +12,169 @@ This is the natural state of all systems. Over time, complexity grows and change
 
 A typical sync handler in a young codebase might touch 4–5 services with a handful of I/O calls. Three months later, the same handler — organically extended as features were added — can easily touch 6+ services with 26–62 I/O calls, loops per entity, and multiple code paths. The code is still "correct," but it now fails reliably in production because of the math below.
 
+### Example: how a handler grows
+
+#### How it started
+
+```
+SyncEntityOnFeatureToggle(message)
+│
+├── [RPC] entityService.GetEntityHeader(entityId)       ──► Entity Service
+├── [RPC] orgService.GetOrganization(orgId)             ──► Org Service
+├── [RPC] mappingService.GetOrgMapping(orgId)           ──► Mapping Service
+├── [RPC] mappingService.UpsertOrgMapping(...)          ──► Mapping Service
+│        (conditional: only if no existing mapping)
+└── [DB WRITE] db.UpsertOrg(...)                        ──► Database
+
+Total: 4–5 I/O calls
+```
+
+```
+Services:  ┌──────────────────┬───────┐
+           │ Entity Service   │ 1 RPC │
+           │ Org Service      │ 1 RPC │
+           │ Mapping Service  │ 1–2   │
+           │ Database         │ 1     │
+           ├──────────────────┼───────┤
+           │ TOTAL            │ 4–5   │
+           └──────────────────┴───────┘
+```
+
+At 99.9% per hop, 500 ops/day: **P(clean day) ≈ 78%**
+
+---
+
+#### How it's going — 3 months later (1 member, PATH B)
+
+```
+SyncEntityOnFeatureToggle(message)
+│
+├──► SyncOrganization(orgId)
+│    ├── [RPC] orgService.GetOrganization(orgId)           ──► Org Service
+│    ├── [RPC] mappingService.GetOrgMapping(orgId)         ──► Mapping Service
+│    ├── [RPC] mappingService.UpsertOrgMapping(...)        ──► Mapping Service
+│    ├── [DB WRITE] db.UpsertOrg(...)                      ──► Database
+│    ├── [DB READ]  db.GetOrg(orgId)   (re-fetch on insert)──► Database
+│    └── [DB WRITE] db.InsertOrgHistory(...)               ──► Database
+│
+├──► ProvisionEntity(entityId)
+│    ├── [RPC] entityService.GetEntities(orgId)            ──► Entity Service
+│    ├── [RPC] entityService.GetEntityHeader(entityId)     ──► Entity Service
+│    │
+│    ├──► IsFeatureEnabledForOrg(orgId)
+│    │    ├── [RPC] entityService.GetEntitiesForOrg(orgId) ──► Entity Service
+│    │    └── [RPC] featureService.GetFeatures(orgId)      ──► Feature Service
+│    │
+│    ├── [RPC] mappingService.GetOrgMapping(orgId)         ──► Mapping Service
+│    ├── [DB READ]  db.GetEntity(entityId)                 ──► Database
+│    ├── [DB WRITE] db.UpsertEntity(...)                   ──► Database
+│    └── [RPC] mappingService.UpdateEntityMapping(...)     ──► Mapping Service
+│
+└──► SyncMembersAsync(entityId)
+     ├── [RPC] entityService.GetEntityHeader(entityId)     ──► Entity Service
+     │
+     ├──► IsFeatureEnabledForOrg(orgId)
+     │    ├── [RPC] entityService.GetEntitiesForOrg(orgId) ──► Entity Service
+     │    └── [RPC] featureService.GetFeatures(orgId)      ──► Feature Service
+     │
+     ├── [RPC] mappingService.GetOrgMapping(orgId)         ──► Mapping Service
+     ├── [RPC] userService.GetMembersForEntity(entityId)   ──► User Service
+     │
+     └──► for each member:                                 ×N members
+          ├── [DB READ] db.GetUser(email)                  ──► Database
+          ├─ if NEW member:
+          │  ├── [DB SESSION] StartTransaction             ──► Database
+          │  ├── [DB WRITE]   db.InsertUser(...)           ──► Database
+          │  └── [DB WRITE]   db.InsertUserHistory(...)    ──► Database
+          └─ if EXISTING member:
+             ├── [DB SESSION] StartTransaction             ──► Database
+             ├── [DB WRITE]   db.UpdateUser(...)           ──► Database
+             └── [DB WRITE]   db.UpdateUserHistory(...)    ──► Database
+```
+
+```
+Services:  ┌──────────────────┬──────────────────────────┐
+           │ Entity Service   │ 6 RPC                    │
+           │ Mapping Service  │ 4 RPC                    │
+           │ Feature Service  │ 2 RPC                    │
+           │ Org Service      │ 1 RPC                    │
+           │ User Service     │ 1 RPC                    │
+           │ Database         │ 6–9 (+ 3 per add. member)│
+           ├──────────────────┼──────────────────────────┤
+           │ TOTAL (1 member) │ 24–28                    │
+           │ TOTAL (5 members)│ ~40                      │
+           │ TOTAL (10 mbrs)  │ ~55                      │
+           └──────────────────┴──────────────────────────┘
+```
+
+At 99.9% per hop, 500 ops/day, 28 hops: **P(clean day) ≈ 0%** · **E(fails/day) ≈ 12**
+
+Same handler. Same feature. 6× more services. 5–6× more I/O. Now fails reliably in production.
+
+---
+
+### Example: auth flow with a polling loop
+
+A provisioning flow where missing entities must be created before the user can proceed:
+
+```
+AuthenticateAndProvision(request)
+│
+├── [DB READ] db.GetUser(userId)                           ──► Database
+├── [RPC] mappingService.GetOrgMapping(corpId)             ──► Mapping Service
+│
+├──► LoadOrgStructure(orgId)
+│    ├── [DB READ] db.GetOrg(orgId)                        ──► Database
+│    ├── [DB READ] db.GetEntities(orgId)                   ──► Database
+│    ├── [DB READ] db.GetSharedMembers(orgId)              ──► Database
+│    ├── [DB READ] db.GetMembers(orgId)                    ──► Database
+│    └── [DB READ] db.GetSharedMemberEntities(orgId)       ──► Database
+│
+├──► ProvisionMissingEntities(missing)                     ×N missing entities
+│    └──► for each missing entity:
+│         │
+│         ├── [RPC] provisioningService.CreateEntity(...)  ──► Provisioning
+│         │
+│         └──► POLLING LOOP (up to 40 iterations × 100ms apart)
+│              └── [RPC] provisioningService.GetStatus(...)──► Provisioning
+│                  └── [RPC] ...                           ──► Provisioning
+│                      └── [RPC] ...                       ──► Provisioning
+│                          └── ... up to 40×
+│
+│    └──► for each provisioned entity:
+│         ├──► IsFeatureEnabledForOrg(orgId)
+│         │    ├── [RPC] entityService.GetEntities(orgId)  ──► Entity Service
+│         │    └── [RPC] featureService.GetFeatures(...)   ──► Feature Service
+│         ├── [RPC] featureService.AddFeature(entityId)    ──► Feature Service
+│         └── [RPC] mappingService.UpdateMapping(...)      ──► Mapping Service
+│
+├──► UpdateExistingMemberships(existing)                   ×M entities
+│    ├── [RPC] entityService.GetEntitySummaries(ids)       ──► Entity Service
+│    └── for each entity user lacks access to:
+│         └── [RPC] userService.AddRole(userId, entityId)  ──► User Service
+│
+└── return response
+```
+
+```
+Services:  ┌──────────────────────┬────────────────────────────────┐
+           │ Database             │ 6 reads (fixed)                │
+           │ Mapping Service      │ 2 RPC (fixed)                  │
+           │ Provisioning         │ 1 + up to 40 polls per entity! │
+           │ Entity Service       │ 3 per created + 1              │
+           │ Feature Service      │ 2 per created entity           │
+           │ User Service         │ 1 per existing entity          │
+           ├──────────────────────┼────────────────────────────────┤
+           │ TOTAL (0 missing)    │ ~12                            │
+           │ TOTAL (1 missing)    │ ~57                            │
+           │ TOTAL (3 missing)    │ ~144                           │
+           └──────────────────────┴────────────────────────────────┘
+```
+
+At 99.9% per hop, 57 hops, 100 logins/day: **P(clean day) ≈ 0%** · **E(fails/day) ≈ 5**
+
+The polling loop is the red flag. Each iteration is a synchronous RPC call inside a user-facing request. Under load this becomes the tail latency explosion from [Chapter 2 of the course](https://github.com/dmytro-kushnir-hudl/engineering-notes/blob/main/system_design_from_first_principles.md#2-master-the-math-of-scale) made concrete.
+
 ---
 
 ## Napkin Math for Network Reliability
